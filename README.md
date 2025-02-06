@@ -5,6 +5,7 @@ This library contains implementations of kinematic algorithms for serial manipul
 
 ## Dependencies:
 * [Eigen](http://eigen.tuxfamily.org)
+* [fcl](https://github.com/flexible-collision-library/fcl)
 
 ## Documentation:
 The code is documented using [Doxygen](https://www.doxygen.org) style comments

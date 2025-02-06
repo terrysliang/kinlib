@@ -24,6 +24,8 @@
 #include "kinlib.h"
 #include "manipulator.h"
 #include "DualQuat.h"
+#include "lemke.h"
+#include "collision_utils.h"
 
 #define PURE_TRANSLATION_ROT_ANGLE_THRESHOLD  1.0e-5
 #define PURE_ROTATION_PITCH_THRESHOLD         1.0e-5
@@ -139,6 +141,21 @@ Eigen::Matrix4d getTransformationInv(const Eigen::Matrix4d &g);
 Eigen::Matrix<double,6,6> getAdjoint(const Eigen::Matrix4d &g);
 
 /*!
+   \brief Computes the Moore-Penrose pseudo-inverse of a matrix using Singular Value Decomposition (SVD).
+  
+   This function calculates the pseudo-inverse of the input matrix using Eigen's JacobiSVD.
+   Singular values smaller than a specified tolerance are treated as zero to improve numerical stability.
+  
+   \param matrix The input matrix to compute the pseudo-inverse. Must be an Eigen::MatrixXd.
+   \param tolerance A threshold for considering singular values as zero. Default is 1e-6.
+   \return The pseudo-inverse of the input matrix as an Eigen::MatrixXd.
+  
+   \note This implementation mimics the behavior of MATLAB's `pinv()` function.
+         It is suitable for rank-deficient matrices and handles numerical instability by truncating small singular values.
+ */
+Eigen::MatrixXd svdPseudoInverse(const Eigen::MatrixXd &matrix, double tolerance = 1e-6);
+
+/*!
   \brief    Get screw parameters for a constant screw motion
 
   \details  Determines the screw parameters for a constant screw motion between
@@ -206,6 +223,7 @@ ErrorCodes getScrewSegments(const std::vector<Eigen::Matrix4d> &g_seq,
                             double max_pos_d = 0.05,
                             double max_rot_d = 0.5);
 
+
 class KinematicsSolver
 {
   public:
@@ -250,6 +268,21 @@ class KinematicsSolver
                       Eigen::Matrix4d &g_base_tool);
 
     /*!
+      \brief    Forward Kinematics of manipulator
+
+      \details  This function solves the forward kinematics of the manipulator
+                for the given joint values and returns the intermediate transform of each link
+                end-effector pose is therefore the last element of the transform vector
+
+      \param    jnt_values              Joint values of manipulator
+      \param    intermediate_transforms Variable to store intermediate transform of each link
+
+      \return   Operation status
+    */
+    ErrorCodes getFK(const Eigen::VectorXd &jnt_values,
+                    std::vector<Eigen::Matrix4d> &intermediate_transforms);
+
+    /*!
       \brief    Get spatial jacobian of manipulator
 
       \details  This function solves for the spatial jacobian of the manipulator
@@ -281,6 +314,16 @@ class KinematicsSolver
         eigen_ext::DualQuat &dq_f,
         const Eigen::VectorXd &jnt_values,
         Eigen::VectorXd &jnt_values_increment);
+
+
+    Eigen::VectorXd getAdjustedJoints(
+      double h,
+      const std::vector<double> &dist_array,
+      const Eigen::MatrixXd &contact_normal_array,
+      double safe_dist,
+      const Eigen::VectorXd &current_joint_values,
+      const Eigen::VectorXd &next_joint_values,
+      const std::vector<Eigen::MatrixXd> &j_contact_array);
 
     /*!
       \brief    Get motion plan for manipulator
@@ -322,6 +365,32 @@ class KinematicsSolver
                               const Eigen::Matrix4d &g_f,
                               trajectory_msgs::JointTrajectory &jnt_trajectory,
                               std::vector<geometry_msgs::Pose> &ee_trajectory);
+
+    /*!
+      \brief    Get motion plan for manipulator
+
+      \details  This function solves for a motion plan based on the given
+                initial joint angles and final end-effector configuration using
+                Screw Linear Interpolation 
+
+      \param    init_jnt_values     Initial joint values of manipulator
+      \param    g_i                 Initial end-effector configuration
+      \param    g_f                 Final end-effector configuration required
+      \param    obstacles           Collection of obstacles in the environment
+      \param    num_links_ignore    Number of manipulator links to ignore
+      \param    grasped_object      Grasped object (pass nullptr if N/A)
+      \param    jnt_trajectory      Variable to store motion plan
+
+      \return   Operation status
+    */
+    ErrorCodes getMotionPlanWithCollisionAvoidance(
+    const Eigen::VectorXd &init_jnt_values,
+    const Eigen::Matrix4d &g_i,
+    const Eigen::Matrix4d &g_f,
+    const int num_links_ignore,
+    const std::vector<std::shared_ptr<CollisionUtils::ObstacleBase>> &obstacles,
+    const std::shared_ptr<CollisionUtils::ObstacleBase> &grasped_object,
+    trajectory_msgs::JointTrajectory &jnt_trajectory);
 
   private:
     /*!

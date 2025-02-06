@@ -113,6 +113,26 @@ class Manipulator
     Eigen::Matrix4d getReferenceConfiguration(void);
 
     /*!
+      \brief    Get static transformations for all joints
+
+      \details  Returns the static transformations (gst0_i) for all joints
+
+      \return   List of static transformations
+    */
+    std::vector<Eigen::Matrix4d> getStaticTransformations(void);
+
+    /*!
+      \brief    Get static transformation for a specific joint
+
+      \details  Returns the static transformation for the specified joint index
+
+      \param    joint_index Index of the joint
+
+      \return   Static transformation for the joint
+    */
+    Eigen::Matrix4d getStaticTransformation(unsigned int joint_index);
+
+    /*!
       \brief    Get number of joints
 
       \details  Returns the number of joints present in the manipulator
@@ -120,6 +140,20 @@ class Manipulator
       \return   Number of joints
     */
     unsigned int getNumberOfJoints(void);
+
+
+
+        /*!
+      \brief    Adds a joint to the manipulator
+
+      \details  This function adds a intermediate static transformation gst0_i into the
+                gst0_i_list_
+
+      \param    gst0_i   intermediate static transformation
+
+      \return   Status of operation
+    */ 
+    ErrorCodes addStaticTransformation(const Eigen::Matrix4d & gst0_i);
 
     /*!
       \brief    Adds a joint to the manipulator
@@ -165,7 +199,7 @@ class Manipulator
 
       \return   Status of operation
     */
-    ErrorCodes  setReferenceConfiguration(const Eigen::Matrix4d & g_ref);
+    ErrorCodes  setReferenceConfiguration(const Eigen::Matrix4d & g_ref); 
 
   //private:
     /*!
@@ -221,6 +255,14 @@ class Manipulator
                 end-effector
     */
     Eigen::Matrix4d gst0_;
+
+    /*!
+      \brief    %Manipulator static transformations for joints
+
+      \details  This variable stores the static transformations (gst0_i) for
+                all the joints relative to the base frame
+    */
+    std::vector<Eigen::Matrix4d> gst0_i_list_;
 
     /*!
       \brief    Joint configuration with respect to base frame

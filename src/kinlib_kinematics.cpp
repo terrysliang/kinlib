@@ -4,7 +4,7 @@
 
 /* Author: Dasharadhan Mahalingam */
 
-//#include <iostream>
+#include <iostream>
 #include "kinlib/kinlib_kinematics.h"
 
 Eigen::IOFormat PrintFormat(4,0,", ","\n");
@@ -198,6 +198,20 @@ Eigen::Matrix<double,6,6> getAdjoint(const Eigen::Matrix4d &g)
   return adj;
 }
 
+Eigen::MatrixXd svdPseudoInverse(const Eigen::MatrixXd &matrix, double tolerance) {
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(matrix, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    double threshold = tolerance * std::max(matrix.cols(), matrix.rows()) * svd.singularValues().array().abs().maxCoeff();
+    
+    // Materialize singular values inversion with thresholding
+    Eigen::VectorXd singularValuesInv = svd.singularValues();
+    for (int i = 0; i < singularValuesInv.size(); ++i) {
+        singularValuesInv(i) = (singularValuesInv(i) > threshold) ? (1.0 / singularValuesInv(i)) : 0.0;
+    }
+
+    // Compute pseudo-inverse
+    return svd.matrixV() * singularValuesInv.asDiagonal() * svd.matrixU().transpose();
+}
+
 ErrorCodes getScrewParameters(  const Eigen::Matrix4d &g_i,
                                 const Eigen::Matrix4d &g_f,
                                 Eigen::Vector3d &omega,
@@ -362,7 +376,7 @@ ErrorCodes getNearestPoseOnScrew( const Eigen::Matrix4d &g_i,
   {
     L = t_f - t_i;
 
-    if(L < 0.001)
+    if(L < 0.0001)
     {
       t = (t_i + t_f) / 2.0;
       break;
@@ -433,12 +447,14 @@ ErrorCodes getScrewSegments(const std::vector<Eigen::Matrix4d> &g_seq,
   {
     for(end_idx = start_idx + 1; end_idx < g_seq.size(); end_idx++)
     {
+      double prev_nearest_t = -1;
+
       for(itr = start_idx + 1; itr <= end_idx; itr++)
       {
         getNearestPoseOnScrew(g_seq[start_idx], g_seq[end_idx], g_seq[itr],
                               nearest_t, pos_d_diff, rot_d_diff);
 
-        if((pos_d_diff > max_pos_d) || (rot_d_diff > max_rot_d))
+        if((pos_d_diff > max_pos_d) || (rot_d_diff > max_rot_d) || (std::abs(nearest_t - prev_nearest_t) < 1e-3))
         {
           segs.push_back(end_idx);
           start_idx = end_idx;
@@ -450,6 +466,8 @@ ErrorCodes getScrewSegments(const std::vector<Eigen::Matrix4d> &g_seq,
 
           break;
         }
+
+        prev_nearest_t = nearest_t;
       }
 
       if(end_idx == (g_seq.size() - 1))
@@ -575,7 +593,7 @@ bool KinematicsSolver::loadManipulator( std::string robot_desc_file,
     }
     else
     {
-      if(itr < (manip_chain.getNrOfSegments()-1))
+      if(itr < (manip_chain.getNrOfSegments()))
       {
         manipulator_.modifyEndJointTipPose(t_ref);
       }
@@ -627,6 +645,55 @@ ErrorCodes KinematicsSolver::getFK(const Eigen::VectorXd &jnt_values,
 
   return ErrorCodes::OPERATION_SUCCESS;
 }
+
+ErrorCodes KinematicsSolver::getFK(const Eigen::VectorXd &jnt_values,
+                                   std::vector<Eigen::Matrix4d> &intermediate_transforms) {
+    Eigen::Matrix4d g;
+    Eigen::Matrix4d g_cumulative;
+
+    g_cumulative.setIdentity();
+    intermediate_transforms.clear();
+
+    intermediate_transforms.push_back(g_cumulative);
+
+    for (unsigned int itr = 0; itr < manipulator_.joint_count_; itr++) {
+        g.setIdentity();
+
+        if (manipulator_.joint_types_[itr] == JointType::Revolute) {
+            // Determine exponential for revolute joint
+            Eigen::Matrix3d rot_mat;
+            Eigen::Vector3d rot_axis(manipulator_.joint_axes_[itr].head<3>());
+            rot_mat = Eigen::AngleAxisd(jnt_values(itr), rot_axis);
+            g.block<3, 3>(0, 0) = rot_mat;
+
+            g.block<3, 1>(0, 3) = (Eigen::Matrix3d::Identity() - rot_mat) *
+                                  manipulator_.joint_q_[itr].head<3>();
+        } else if (manipulator_.joint_types_[itr] == JointType::Prismatic) {
+            // Determine exponential for prismatic joint
+            Eigen::Vector3d transl_axis(manipulator_.joint_axes_[itr].head<3>());
+            g.block<3, 1>(0, 3) = jnt_values(itr) * transl_axis;
+        }
+
+        // Retrieve the static transformation for this joint (gst0_i)
+        Eigen::Matrix4d gst0_i = manipulator_.getStaticTransformation(itr + 1);
+
+        // Update the cumulative transformation (base to current joint)
+        g_cumulative = g_cumulative * g;
+
+        // Store the cumulative transformation
+        intermediate_transforms.push_back(g_cumulative * gst0_i);
+    }
+
+    // Apply the static tool transformation (gst0_)
+    g_cumulative = g_cumulative * manipulator_.getReferenceConfiguration();
+
+    // Store the final transformation (base to tool frame)
+    intermediate_transforms.push_back(g_cumulative);
+
+    return ErrorCodes::OPERATION_SUCCESS;
+}
+
+
 
 ErrorCodes KinematicsSolver::getSpatialJacobian(
     const Eigen::VectorXd &jnt_values,
@@ -783,6 +850,69 @@ ErrorCodes KinematicsSolver::getResolvedMotionRateControlStep(
   return ErrorCodes::OPERATION_SUCCESS;
 }
 
+Eigen::VectorXd KinematicsSolver::getAdjustedJoints(
+  double h,
+  const std::vector<double> &dist_array,
+  const Eigen::MatrixXd &contact_normal_array,
+  double safe_dist,
+  const Eigen::VectorXd &current_joint_values,
+  const Eigen::VectorXd &next_joint_values,
+  const std::vector<Eigen::MatrixXd> &j_contact_array) {
+
+  // Identify contacts violating safe distance
+  // If no violating contacts, return next_joint_values as is
+  std::vector<int> violating_contacts;
+  for (size_t i = 0; i < dist_array.size(); ++i) {
+      if (dist_array[i] < safe_dist) {
+          violating_contacts.push_back(i);
+      }
+  }
+
+  if (violating_contacts.empty()) {
+      return next_joint_values;
+  }
+  // Define q and M matrices
+  int nc = contact_normal_array.cols();
+  Eigen::VectorXd q(nc);
+  Eigen::MatrixXd M(nc, nc);
+  q.setZero();
+  M.setZero();
+  for (int n = 0; n < nc; ++n) {
+      q[n] = dist_array[n] - safe_dist +
+              h * contact_normal_array.col(n).transpose() *
+                  j_contact_array[n] * (next_joint_values - current_joint_values);
+
+      for (int m = 0; m < nc; ++m) {
+      M(n, m) = h * contact_normal_array.col(n).transpose() *
+                j_contact_array[n] *
+                svdPseudoInverse(j_contact_array[m]) *
+                contact_normal_array.col(m);
+      }
+  }
+
+  // Static scaling for q and M (more stable than dynamic scaling)
+  q *= 1000;
+  M *= 1000;
+  
+  // Solve the LCP using Lemke's solver
+  Eigen::VectorXd z;
+  LemkeResult lemke_result = Lemke(q, M);
+  z = lemke_result.z;
+
+  // Rescale z based on the scaling factor
+  z /= 1000;
+
+  // Calculate compensating displacement
+  Eigen::VectorXd comp_joint_values = Eigen::VectorXd::Zero(current_joint_values.size());
+  for (int i = 0; i < nc; ++i) {
+      comp_joint_values += svdPseudoInverse(j_contact_array[i]) * contact_normal_array.col(i) * z[i];
+  }
+
+  // Update the next joint values
+  Eigen::VectorXd adjusted_joint_values = next_joint_values + comp_joint_values;
+
+  return adjusted_joint_values;
+}
 
 ErrorCodes KinematicsSolver::getMotionPlan(
     const Eigen::VectorXd &init_jnt_values,
@@ -910,7 +1040,7 @@ ErrorCodes KinematicsSolver::getMotionPlan(
 
   kinlib::getScrewParameters(g_i, g_f, omega, theta, h, l, screw_type);
 
-  while((!(pos_dist < 0.0001 && rot_dist < 0.001)) && (itr_cnt < 10000))
+  while((!(pos_dist < 0.0005 && rot_dist < 0.005)) && (itr_cnt < 10000))
   {
 
     itr_cnt++;
@@ -977,9 +1107,11 @@ determine_next_angles:
     {
 
       jnt_values[i] = next_joint_values(i);
+      //std::cout << i <<"th @Joint limits are" << joint_limits(i,0) << " and " << joint_limits(i,1) << std::endl;
 
-      if( (next_joint_values(i) > joint_limits(i,0)) &&
-          (next_joint_values(i) < joint_limits(i,1)))
+      if( ((next_joint_values(i) > joint_limits(i,0)) &&
+          (next_joint_values(i) < joint_limits(i,1))) ||
+          (i % 2 == 0 && i <= 6)) // hack for kinova robot since its 1/3/5/7th joints have no limits
       {
         continue;
       }
@@ -1246,11 +1378,13 @@ determine_next_angles:
     // Check if joint limits are satisfied
     for(int i = 0; i < manipulator_.joint_count_; i++)
     {
+      //std::cout << i <<"th @Joint limits are" << joint_limits(i,0) << " and " << joint_limits(i,1) << std::endl;
 
       jnt_values[i] = next_joint_values(i);
 
-      if( (next_joint_values(i) > joint_limits(i,0)) &&
-          (next_joint_values(i) < joint_limits(i,1)))
+      if(((next_joint_values(i) > joint_limits(i,0)) &&
+          (next_joint_values(i) < joint_limits(i,1))) ||
+          (i % 2 == 0 && i <= 6)) // hack for kinova robot since its 1/3/5/7th joints have no limits
       {
         continue;
       }
@@ -1313,6 +1447,340 @@ determine_next_angles:
     iso_pose.matrix() = g_current;
     tf::poseEigenToMsg(iso_pose, geo_pose);
     ee_trajectory.push_back(geo_pose);
+
+    dq_current = eigen_ext::DualQuat::transformationToDualQuat(g_current);
+
+    current_joint_values = next_joint_values;
+
+    pos_dist = positionDistance(g_current, g_f);
+    rot_dist = rotationDistance(dq_current, dq_f);
+  }
+
+  return ErrorCodes::OPERATION_SUCCESS;
+}
+
+
+ErrorCodes KinematicsSolver::getMotionPlanWithCollisionAvoidance(
+    const Eigen::VectorXd &init_jnt_values,
+    const Eigen::Matrix4d &g_i,
+    const Eigen::Matrix4d &g_f,
+    const int num_links_ignore,
+    const std::vector<std::shared_ptr<CollisionUtils::ObstacleBase>> &obstacles,
+    const std::shared_ptr<CollisionUtils::ObstacleBase> &grasped_object,
+    trajectory_msgs::JointTrajectory &jnt_trajectory)
+{
+  Eigen::VectorXd joint_values_inc;
+  Eigen::VectorXd current_joint_values;
+  Eigen::VectorXd next_joint_values;
+  
+#if DEBUG
+
+  std::time_t now = std::time(0);
+  std::tm* timestamp = std::localtime(&now);
+
+  char timestamp_char[100];
+  strftime(timestamp_char, 100, timestamp_str.c_str(), timestamp);
+
+  std::string current_log_folder(timestamp_char);
+  std::string log_dir_path = log_dir + "/" + current_log_folder;
+
+  std::string timestamp_str_val(timestamp_char);
+  std::string log_file_path = log_dir_path + "/" + timestamp_str_val 
+                            + "_motion_plan.csv";
+
+  std::ofstream log_file;
+
+  if(mkdir(log_dir.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH))
+  {
+    if(errno != EEXIST)
+    {
+      std::cout << "Error : Cannot create log folders\n";
+      std::cout << "Error " << errno << ": " << strerror(errno);
+      std::cout.flush();
+      log_folder_error = true;
+    }
+  }
+
+  if(!log_folder_error)
+  {
+    if(mkdir(log_dir_path.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH))
+    {
+      if(errno != EEXIST)
+      {
+        std::cout << "Error : Cannot create log folders\n";
+        std::cout << "Error " << errno << ": " << strerror(errno);
+        std::cout.flush();
+        log_folder_error = true;
+      }
+    }
+    
+    if(!log_folder_error)
+    {
+      log_file.open(log_file_path, std::ofstream::out | std::ofstream::app);
+
+      if(!log_file.is_open())
+      {
+        log_file_error = true;
+
+        std::cout << "Error : Cannot open log file\n";
+        std::cout.flush();
+      }
+    }
+  }
+
+#endif
+
+  double pos_dist, rot_dist;
+
+  current_joint_values = init_jnt_values;
+
+  unsigned long int itr_cnt = 0;
+
+  eigen_ext::DualQuat dq_i(g_i);
+  eigen_ext::DualQuat dq_f(g_f);
+
+  Eigen::Matrix4d g_current;
+
+  eigen_ext::DualQuat dq_current = dq_i;
+  eigen_ext::DualQuat dq_next;
+
+  pos_dist = positionDistance(g_i, g_f);
+  rot_dist = rotationDistance(dq_i, dq_f);
+
+  Eigen::MatrixXd joint_limits;
+  joint_limits.resize(manipulator_.joint_count_, 2);
+  for(int i = 0; i < manipulator_.joint_count_; i++)
+  {
+    joint_limits(i,0) = manipulator_.joint_limits_[i].lower_limit_;
+    joint_limits(i,1) = manipulator_.joint_limits_[i].upper_limit_;
+  }
+
+  double beta = 0.5;
+  double step_size = beta;
+
+  double tau = 0.001;
+  double tau_i = 0.01;
+
+  double tau_max = 0.1;
+  double tau_break = 0.9;
+
+  Polynomial tau_f(tau_break, tau_max);
+
+  Eigen::VectorXd joint_values_delta;
+
+  trajectory_msgs::JointTrajectoryPoint jnt_trajectory_point;
+  jnt_trajectory.joint_names = manipulator_.joint_names_;
+  jnt_trajectory.points.clear();
+
+  std::vector<double> jnt_values(7,0);
+
+  Eigen::Vector3d omega;
+  double theta;
+  double h;
+  Eigen::Vector3d l;
+  ScrewMotionType screw_type;
+  
+  Eigen::Vector3d curr_omega;
+  double curr_theta;
+  double curr_h;
+  Eigen::Vector3d curr_l;
+  ScrewMotionType curr_screw_type;
+
+  kinlib::getScrewParameters(g_i, g_f, omega, theta, h, l, screw_type);
+
+  while((!(pos_dist < 0.0005 && rot_dist < 0.005)) && (itr_cnt < 10000))
+  {
+    itr_cnt++;
+
+    step_size = beta;
+
+    dq_next = eigen_ext::DualQuat::dualQuatInterpolation(
+        dq_current, dq_f, tau);
+
+    if(tau < tau_max)
+    {
+      Eigen::Matrix4d g_next_temp = dq_next.getTransform();
+
+      kinlib::getScrewParameters(
+          g_next_temp, g_f, curr_omega, curr_theta, curr_h, curr_l, curr_screw_type);
+
+      if(theta != 0)
+      {
+        double motion_dist = std::abs(curr_theta / theta);
+        
+        tau = tau_f.getValue(motion_dist) + tau_i;
+      }
+    }
+
+    getResolvedMotionRateControlStep(
+        dq_current, dq_next, current_joint_values, joint_values_inc);
+
+    if(joint_values_inc.hasNaN())
+    {
+      //jnt_values_seq.clear();
+      std::cout << "\nJoint increments are not finite!\n";
+      std::cout.flush();
+
+#if DEBUG
+      if(!(log_folder_error || log_file_error))
+      {
+        for(int temp_itr = 0; temp_itr < joint_values_inc.rows(); temp_itr++)
+        {
+          log_file << 1000 << ',';
+        }
+        log_file << '\n';
+
+        log_file << joint_values_inc << '\n';
+        
+        log_file.flush();
+      }
+#endif
+
+      return ErrorCodes::OPERATION_FAILURE;
+    }
+
+    int joint_limit_id = 0;
+
+determine_next_angles:
+
+    joint_limit_id = 0;
+
+    joint_values_delta = joint_values_inc * step_size;
+
+    next_joint_values = current_joint_values + joint_values_delta;
+
+    // @TODO: add collision check here
+
+    Eigen::MatrixXd contact_normal_array;
+    Eigen::MatrixXd spatial_jacobian;
+    std::vector<double> dist_array;
+    std::vector<double> radius_array;
+    std::vector<Eigen::MatrixXd> contact_points_array;
+    std::vector<Eigen::MatrixXd> j_contact_array;
+    std::vector<Eigen::Matrix4d> intermediate_transforms;
+    std::vector<std::pair<Eigen::Vector3d, double>> rotation_adjustments;
+    std::vector<std::shared_ptr<CollisionUtils::ObstacleBase>> link_cylinders;
+
+    radius_array.resize(7, 0.035);
+    getFK(next_joint_values, intermediate_transforms);
+    rotation_adjustments = {
+        {Eigen::Vector3d(1, 0, 0), M_PI},
+        {Eigen::Vector3d(1, 0, 0), 0.5 * M_PI},
+        {Eigen::Vector3d(1, 0, 0), M_PI},
+        {Eigen::Vector3d(1, 0, 0), 0.5 * M_PI},
+        {Eigen::Vector3d(1, 0, 0), M_PI},
+        {Eigen::Vector3d(1, 0, 0), 0.5 * M_PI},
+        {Eigen::Vector3d(1, 0, 0), M_PI}};
+
+    link_cylinders = CollisionUtils::armCylinderModel(num_links_ignore, radius_array, intermediate_transforms, rotation_adjustments);
+
+    // for (size_t i = 0; i < link_cylinders.size(); ++i) {
+    //     auto geometry = link_cylinders[i]->getCollisionObject().getCollisionGeometry();
+    //     std::cout << "\nLink " << i << " Transform:\n";
+    //     std::cout << "  Position: " << link_cylinders[i]->getCollisionObject().getTransform().translation().transpose() << "\n";
+    //     std::cout << "  Orientation: \n" << link_cylinders[i]->getCollisionObject().getTransform().rotation() << "\n";
+    //     // Try dynamic_cast for Cylinderd
+    //     const auto* cylinder = dynamic_cast<const fcl::Cylinderd*>(geometry);
+    //     if (cylinder) {
+    //         std::cout << "Link " << i << " Radius: " << cylinder->radius
+    //                   << ", Height: " << cylinder->lz << std::endl;
+    //     } else {
+    //         std::cout << "Link " << i << " does not have a cylindrical geometry." << std::endl;
+    //     }
+    // }
+
+    
+    getSpatialJacobian(next_joint_values, spatial_jacobian);
+    if (grasped_object) 
+    { // the best part of this is that you dont need to dive into the te
+      grasped_object->setTransform(intermediate_transforms.back().block<3, 1>(0, 3), intermediate_transforms.back().block<3, 3>(0, 0));
+    }
+
+    if (CollisionUtils::getCollisionInfo(link_cylinders, obstacles, grasped_object, spatial_jacobian, 
+                                    num_links_ignore, manipulator_.joint_count_, contact_normal_array,
+                                    dist_array, contact_points_array, j_contact_array) != ErrorCodes::OPERATION_SUCCESS) 
+    {
+      return ErrorCodes::OPERATION_FAILURE;
+    }
+    
+    double h = 0.001;
+    double safe_dist = 0.005;
+    Eigen::VectorXd adjusted_joint_values;
+
+    adjusted_joint_values = KinematicsSolver::getAdjustedJoints(h, dist_array, contact_normal_array,
+                                                                safe_dist, current_joint_values, 
+                                                                next_joint_values, j_contact_array);
+    
+    next_joint_values = adjusted_joint_values;
+
+    // Check if joint limits are satisfied
+    for(int i = 0; i < manipulator_.joint_count_; i++)
+    {
+
+      jnt_values[i] = next_joint_values(i);
+      //std::cout << i <<"th @Joint limits are" << joint_limits(i,0) << " and " << joint_limits(i,1) << std::endl;
+
+      if( ((next_joint_values(i) > joint_limits(i,0)) &&
+          (next_joint_values(i) < joint_limits(i,1))) ||
+          (i % 2 == 0 && i <= 6)) // hack for kinova robot since its 1/3/5/7th joints have no limits
+      {
+        continue;
+      }
+      else
+      {
+        joint_limit_id = i + 1;
+
+        double max_val = fabs(joint_values_delta(0));
+
+        for(int j = 1; j < manipulator_.joint_count_; j++)
+        {
+          if(fabs(joint_values_delta(j)) > max_val)
+          {
+            max_val = fabs(joint_values_delta(j));
+          }
+        }
+
+        if(max_val <= 0.0001)
+        {
+          std::cout << "\nJoint " << manipulator_.joint_names_[i] << " limits reached!\n";
+          std::cout << next_joint_values.transpose().format(PrintFormat)<<'\n';
+          std::cout.flush();
+
+#if DEBUG
+          if(!(log_folder_error || log_file_error))
+          {
+            for(int temp_itr = 0; temp_itr < manipulator_.joint_count_; temp_itr++)
+            {
+              log_file << -1000 << ',';
+            }
+            log_file << '\n';
+
+            log_file.flush();
+          }
+#endif
+          return ErrorCodes::JOINT_LIMIT_ERROR;
+        }
+
+        step_size = step_size / 10;
+        goto determine_next_angles;
+      }
+
+    }
+
+    jnt_trajectory_point.positions = jnt_values;
+    jnt_trajectory.points.push_back(jnt_trajectory_point);
+
+    //jnt_values_seq.push_back(next_joint_values);
+
+#if DEBUG
+    if(!(log_folder_error || log_file_error))
+    {
+      log_file << next_joint_values.transpose().format(CSVFormat) << '\n';
+      log_file.flush();
+    }
+#endif
+
+    getFK(next_joint_values, g_current);
 
     dq_current = eigen_ext::DualQuat::transformationToDualQuat(g_current);
 

@@ -39,9 +39,34 @@ Eigen::Matrix4d Manipulator::getReferenceConfiguration(void)
   return gst0_;
 }
 
+std::vector<Eigen::Matrix4d> Manipulator::getStaticTransformations(void)
+{
+  return gst0_i_list_;
+}
+
+Eigen::Matrix4d Manipulator::getStaticTransformation(unsigned int joint_index)
+{
+  if (joint_index >= gst0_i_list_.size())
+  {
+    throw std::out_of_range("Joint index exceeds the number of static transformations.");
+  }
+  return gst0_i_list_[joint_index];
+}
+
 unsigned int Manipulator::getNumberOfJoints(void)
 {
   return joint_count_;
+}
+
+ErrorCodes Manipulator::addStaticTransformation(const Eigen::Matrix4d & gst0_i)
+{
+  if(gst0_i_list_.empty())
+  {
+    gst0_i_list_.push_back(Eigen::Matrix4d::Identity()); // Base frame
+  }
+  gst0_i_list_.push_back(gst0_i);
+  
+  return OPERATION_SUCCESS;
 }
 
 ErrorCodes Manipulator::addJoint( const JointType & jnt_type,
