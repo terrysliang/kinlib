@@ -110,6 +110,75 @@ std::vector<std::shared_ptr<ObstacleBase>> armCylinderModel(
     return link_cylinders;
 }
 
+std::shared_ptr<ObstacleBase> createMeshFromSTL(
+    const std::string& stl_path, 
+    const Eigen::Matrix4d& transform) {
+    
+    // Load STL file using Assimp
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(stl_path, aiProcess_Triangulate);
+    if (!scene || !scene->mMeshes) {
+        throw std::runtime_error("Failed to load STL file: " + stl_path);
+    }
+
+    // Get mesh from file
+    aiMesh* mesh = scene->mMeshes[0]; // Assuming one mesh per file
+    auto bvh_model = std::make_shared<fcl::BVHModel<fcl::OBBRSS<double>>>();
+
+    std::vector<fcl::Vector3d> vertices;
+    std::vector<fcl::Triangle> triangles;
+
+    // Convert vertices
+    for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
+        vertices.emplace_back(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z);
+    }
+
+    // Convert faces
+    for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
+        aiFace face = mesh->mFaces[i];
+        if (face.mNumIndices == 3) { // Only triangles
+            triangles.emplace_back(face.mIndices[0], face.mIndices[1], face.mIndices[2]);
+        }
+    }
+
+    // Load data into BVH model
+    bvh_model->beginModel();
+    bvh_model->addSubModel(vertices, triangles);
+    bvh_model->endModel();
+
+    // Extract position and orientation for consistency
+    Eigen::Vector3d position = transform.block<3,1>(0,3);
+    Eigen::Matrix3d orientation = transform.block<3,3>(0,0);
+
+    return std::make_shared<MeshObstacle>(bvh_model, position, orientation);
+}
+
+std::vector<std::shared_ptr<ObstacleBase>> armMeshModel(
+    const int num_links_ignore,
+    const std::vector<std::string>& stl_files, 
+    const std::vector<Eigen::Matrix4d>& g_intermediate) {
+
+    std::vector<std::shared_ptr<ObstacleBase>> link_meshes;
+
+    for (size_t i = 1; i < g_intermediate.size() - 1; ++i) {
+        // Skip the links that are to be ignored
+        if (static_cast<int>(i - 1) < num_links_ignore) {
+            link_meshes.push_back(nullptr);  // Placeholder for ignored links
+            continue;
+        }
+
+        if (i - 1 >= stl_files.size()) {
+            throw std::runtime_error("STL file list does not match link count.");
+        }
+        
+        std::string mesh_path = stl_files[i - 1];
+        auto mesh_obj = createMeshFromSTL(mesh_path, g_intermediate[i]);
+        link_meshes.push_back(mesh_obj);
+    }
+
+    return link_meshes;
+}
+
 ErrorCodes checkCollision(const ObstacleBase &obj1,
                          const ObstacleBase &obj2,
                          double &min_dist,

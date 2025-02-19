@@ -5,11 +5,15 @@
 #pragma once
 
 #include <memory>
-#include <fcl/fcl.h>
 #include <vector>
 #include <string>
 #include <optional>
 #include <Eigen/Dense>
+#include <Eigen/Core>
+#include <fcl/fcl.h>
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
 
 #include "kinlib.h"
 
@@ -96,25 +100,28 @@ public:
     }
 };
 
-// Struct for link cylinder information (aborted since offset links are ignored automaticlly for now)
-// struct LinkCylinderInfo : public ObstacleBase {
-//     std::shared_ptr<ObstacleBase> obstacle; 
-//     bool is_offset = false; // Indicates if this is an offset link
+class MeshObstacle : public ObstacleBase {
+    std::shared_ptr<fcl::BVHModel<fcl::OBBRSS<double>>> geometry;
+    fcl::CollisionObjectd collision_object;
 
-//     LinkCylinderInfo() = default;
+public:
+    MeshObstacle(const std::shared_ptr<fcl::BVHModel<fcl::OBBRSS<double>>>& bvh_model,
+                 const Eigen::Vector3d &position, 
+                 const Eigen::Matrix3d &orientation)
+        : geometry(bvh_model),
+          collision_object(geometry, fcl::Transform3d::Identity()) {
+        setTransform(position, orientation);
+    }
 
-//     LinkCylinderInfo(const std::shared_ptr<ObstacleBase> &obs, bool offset = false)
-//         : obstacle(obs), is_offset(offset) {}
+    const fcl::CollisionObjectd &getCollisionObject() const override {
+        return collision_object;
+    }
 
-//     const fcl::CollisionObjectd &getCollisionObject() const override {
-//         return obstacle->getCollisionObject();
-//     }
-
-//     void setTransform(const Eigen::Vector3d &position, const Eigen::Matrix3d &orientation) override {
-//         obstacle->setTransform(position, orientation);
-//     }
-// };
-
+    void setTransform(const Eigen::Vector3d &position, const Eigen::Matrix3d &orientation) override {
+        collision_object.setTranslation(position);
+        collision_object.setRotation(orientation);
+    }
+};
 
 // Utility functions for obstacle creation and collision checking
 /*!
@@ -197,7 +204,7 @@ std::shared_ptr<ObstacleBase> createGraspObject(
                                 orientation, this include a 3 by 1 vector representing the aixe, and a double 
                                 representing how many degrees it should rotate(in radians).
 
-    \return               A vector of shared pointers to `LinkCylinderInfo` objects.
+    \return               A vector of shared pointers to `CylinderObstacle` objects.
 */
 std::vector<std::shared_ptr<ObstacleBase>> armCylinderModel(
     const int num_links_ignore, 
@@ -205,6 +212,34 @@ std::vector<std::shared_ptr<ObstacleBase>> armCylinderModel(
     const std::vector<Eigen::Matrix4d> &g_intermediate, 
     const std::vector<std::pair<Eigen::Vector3d, double>> &rotation_adjustments);
 
+/*!
+    \brief Create Mesh from stl file path
+
+    \param stl_path    stl file path used to create Mesh
+    \param transform   transform of the mesh respect to world frame
+
+
+    \return            A shared pointers to `MeshObstacle` objects.
+*/    
+std::shared_ptr<ObstacleBase> createMeshFromSTL(
+    const std::string& stl_path, 
+    const Eigen::Matrix4d& transform); 
+ 
+
+/*!
+    \brief Create all links' mesh from stl file path
+
+    \param num_links_ignore     Number of manipulator links to ignore (exclude base_link).
+    \param stl_files    stl file path of all links
+    \param g_intermediate   transform of all links respect to world frame
+
+
+    \return            A shared pointers to `MeshObstacle` objects.
+*/ 
+std::vector<std::shared_ptr<ObstacleBase>> armMeshModel(
+    const int num_links_ignore,
+    const std::vector<std::string>& stl_files, 
+    const std::vector<Eigen::Matrix4d>& g_intermediate);
 /*!
     \brief Checks collision between two obstacles.
 

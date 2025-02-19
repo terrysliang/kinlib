@@ -1672,8 +1672,20 @@ determine_next_angles:
         {Eigen::Vector3d(1, 0, 0), 0.5 * M_PI},
         {Eigen::Vector3d(1, 0, 0), M_PI}};
 
-    link_cylinders = CollisionUtils::armCylinderModel(num_links_ignore, radius_array, intermediate_transforms, rotation_adjustments);
-
+    // Using estimated cylinders to represent links, rotation_adjustment may be unnecessary depending on your robot model
+    // link_cylinders = CollisionUtils::armCylinderModel(num_links_ignore, radius_array, intermediate_transforms, rotation_adjustments);
+    
+    // Using meshes to represent links
+    std::vector<std::string> stl_files;
+    stl_files = { "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link0.stl",
+                  "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link1.stl",
+                  "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link2.stl",
+                  "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link3.stl",
+                  "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link4.stl",
+                  "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link5.stl",
+                  "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link6.stl",
+                  "/home/byd/terry/rokae_ros/xMate7pro_description/meshes/visual/xMatePro7_link7.stl"};
+                  
     // for (size_t i = 0; i < link_cylinders.size(); ++i) {
     //     auto geometry = link_cylinders[i]->getCollisionObject().getCollisionGeometry();
     //     std::cout << "\nLink " << i << " Transform:\n";
